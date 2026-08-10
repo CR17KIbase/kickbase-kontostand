@@ -94,9 +94,7 @@ irgendeine eigene Webseite hosten zu muessen. Sind die beiden Variablen nicht
 gesetzt, gibt das Skript das Ergebnis einfach nur in der Konsole aus.
 """
 
-import hashlib
 import itertools
-import json
 import os
 import sys
 import time
@@ -116,7 +114,6 @@ SEASON_START = "2026-08-03T00:00:00Z" # Datum des Kontostand-Resets (03.08., Uhr
 
 BASE_URL = "https://api.kickbase.com"
 REQUEST_PAUSE_SECONDS = 0.4           # kleine Pause zwischen Requests, um die API nicht zu stressen
-STATE_FILE = "kickbase_state.json"    # merkt sich Zustand zwischen zwei Laeufen (fuer den dynamischen Bonus)
 
 
 # ---------------------------------------------------------------------------
@@ -249,33 +246,6 @@ def send_telegram_message(bot_token: str, chat_id: str, text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Zustand zwischen zwei Laeufen (fuer den dynamisch gemessenen Bonus)
-# ---------------------------------------------------------------------------
-
-def transfer_fingerprint(t: dict[str, Any]) -> str:
-    """Eindeutiger Fingerabdruck eines Transfer-Datensatzes, um 'neue' Transfers
-    seit dem letzten Lauf zu erkennen (unabhaengig von einer echten Transfer-ID,
-    die die API nicht liefert)."""
-    raw = json.dumps(t, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def load_state() -> Optional[dict[str, Any]]:
-    if not os.path.exists(STATE_FILE):
-        return None
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def save_state(state: dict[str, Any]) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f)
-
-
-# ---------------------------------------------------------------------------
 # Kalibrierung
 # ---------------------------------------------------------------------------
 
@@ -403,7 +373,6 @@ def main() -> None:
 
     print("Hole deine eigene Transferhistorie ...")
     my_transfers = get_manager_transfers(token, league_id, my_user_id)
-    my_fingerprints = {transfer_fingerprint(t) for t in my_transfers}
 
     print("Hole Transferhistorie aller anderen Teilnehmer ...")
     other_transfers_by_manager: dict[str, list[dict[str, Any]]] = {}
@@ -413,33 +382,15 @@ def main() -> None:
             continue
         other_transfers_by_manager[manager_id] = get_manager_transfers(token, league_id, manager_id)
 
-    state = load_state()
-
-    force_recal = os.environ.get("FORCE_RECALIBRATION", "").strip().lower() in ("1", "true", "yes", "ja")
-    if force_recal and state is not None:
-        print("FORCE_RECALIBRATION gesetzt - verwerfe gespeicherten Zustand und kalibriere neu.")
-        state = None
-
-    if state is None:
-        print("Kein gespeicherter Zustand gefunden (erster Lauf) - fuehre Anfangs-Kalibrierung durch ...")
-        sign_mapping, known_total_bonus = initial_calibration(my_transfers, my_real_budget, other_transfers_by_manager)
-    else:
-        print("Gespeicherten Zustand aus letztem Lauf geladen - messe Bonus-Zuwachs live ...")
-        sign_mapping = dict(state.get("sign_mapping", []))
-        known_total_bonus = state.get("known_total_bonus", 0)
-        old_fingerprints = set(state.get("my_transfer_fingerprints", []))
-        old_real_budget = state.get("my_real_budget", my_real_budget)
-
-        new_transfers = [t for t in my_transfers if transfer_fingerprint(t) not in old_fingerprints]
-        net_new_transfers = sum(
-            sign_mapping.get(t.get("tty"), 0) * t.get("trp", 0) for t in new_transfers
-        )
-        bonus_delta = (my_real_budget - old_real_budget) - net_new_transfers
-        known_total_bonus += bonus_delta
-
-        print(f"  {len(new_transfers)} neue eigene Transfer(s) seit letztem Lauf.")
-        print(f"  Bonus-Zuwachs seit letztem Lauf: {bonus_delta:,.0f} EUR".replace(",", "."))
-        print(f"  Neuer Gesamt-Bonus (dynamisch, seit Ligastart): {known_total_bonus:,.0f} EUR".replace(",", "."))
+    # Kalibrierung laeuft bei JEDEM Lauf frisch. Der aufgelaufene Bonus ergibt
+    # sich dabei automatisch aus deinem AKTUELLEN echten Kontostand - er ist
+    # damit immer auf dem neuesten Stand, egal wie sich der taegliche Bonus
+    # entwickelt (80k, 90k, 100k pro Tag oder beliebig anders). Ein
+    # Zwischenspeicher zwischen den Laeufen ist dafuer nicht noetig.
+    print("Fuehre Kalibrierung durch (Vorzeichen + aufgelaufener Bonus) ...")
+    sign_mapping, known_total_bonus = initial_calibration(
+        my_transfers, my_real_budget, other_transfers_by_manager
+    )
 
     print("\nErstelle Ergebnis-Tabelle ...\n")
     results = []
@@ -494,14 +445,6 @@ def main() -> None:
             print(f"\n[Warnung] {exc}")
     else:
         print("\n[Hinweis] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID nicht gesetzt - keine Telegram-Nachricht gesendet.")
-
-    # --- Zustand fuer den naechsten Lauf speichern (fuer die dynamische Bonus-Messung) ---
-    save_state({
-        "sign_mapping": list(sign_mapping.items()),
-        "known_total_bonus": known_total_bonus,
-        "my_real_budget": my_real_budget,
-        "my_transfer_fingerprints": list(my_fingerprints),
-    })
 
 
 if __name__ == "__main__":
