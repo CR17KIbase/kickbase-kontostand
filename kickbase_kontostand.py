@@ -60,6 +60,16 @@ aller Teilnehmer am plausibelsten zusammenliegen (kleinste Streuung) - in einer
 jungen Liga mit gleichem Startbudget sollten die Kontostaende nicht um hunderte
 Millionen Euro auseinanderliegen.
 
+WICHTIG: SAISON-FILTER
+-----------------------
+Die Transferhistorie-Endpunkte der Kickbase-API liefern (laut Beispieldaten der
+Community-Doku) die KOMPLETTE Historie ueber mehrere Saisons hinweg, nicht nur
+die aktuelle Saison. Da eure Liga aus einer fruehreren Saison weiterlaeuft und
+der Kontostand zum Saisonstart auf 50 Mio. zurueckgesetzt wurde, wuerden alte
+Transfers aus der Vorsaison die Berechnung verfaelschen, wenn man sie mitzaehlt.
+Deshalb filtert das Skript alle Transfers vor SEASON_START (siehe CONFIG unten)
+konsequent heraus - sowohl bei der Kalibrierung als auch bei der Bonus-Messung.
+
 EINRICHTUNG (lokal)
 -------------------
 1. pip install requests
@@ -72,7 +82,7 @@ EINRICHTUNG (lokal)
 
    (Windows PowerShell: $env:KICKBASE_EMAIL="...")
 
-3. Ggf. unten in CONFIG den Liganamen und die Bonus-Annahme anpassen.
+3. Ggf. unten in CONFIG den Liganamen, das Startbudget und SEASON_START anpassen.
 4. python3 kickbase_kontostand.py
 
 TELEGRAM (fuer automatischen Versand, z.B. aus GitHub Actions)
@@ -100,6 +110,9 @@ import requests
 
 LEAGUE_NAME = "TSV Tiefenbach 25/26"   # muss exakt dem Liganamen in Kickbase entsprechen
 STARTBUDGET = 50_000_000              # Startbudget lt. Liga-Einstellungen (das aendert sich normalerweise nicht)
+SEASON_START = "2026-08-03T00:00:00Z" # Datum des Kontostand-Resets (03.08., Uhrzeit unbekannt ->
+                                       # sicherheitshalber Tagesbeginn UTC). Transfers VOR diesem
+                                       # Zeitpunkt werden ignoriert (gehoeren zur Vorsaison).
 
 BASE_URL = "https://api.kickbase.com"
 REQUEST_PAUSE_SECONDS = 0.4           # kleine Pause zwischen Requests, um die API nicht zu stressen
@@ -167,7 +180,15 @@ def get_my_budget(token: str, league_id: str) -> Optional[int]:
 
 
 def get_manager_transfers(token: str, league_id: str, manager_id: str) -> list[dict[str, Any]]:
-    """Holt die komplette (paginierte) Transferhistorie eines Managers."""
+    """
+    Holt die komplette (paginierte) Transferhistorie eines Managers und filtert
+    dabei alles vor SEASON_START heraus (Transfers aus einer Vorsaison).
+
+    Die Eintraege kommen absteigend chronologisch (neueste zuerst) - sobald wir
+    also den ersten Eintrag vor SEASON_START sehen, koennen wir das Blaettern
+    komplett abbrechen, weil alles Weitere noch aelter waere. Das spart auch
+    unnoetige Anfragen an die Kickbase-API.
+    """
     transfers: list[dict[str, Any]] = []
     start = 0
     seen_page_sizes = set()
@@ -189,7 +210,14 @@ def get_manager_transfers(token: str, league_id: str, manager_id: str) -> list[d
         if not items:
             break
 
-        transfers.extend(items)
+        in_season = [t for t in items if t.get("dt", "") >= SEASON_START]
+        transfers.extend(in_season)
+
+        if len(in_season) < len(items):
+            # Mindestens ein Eintrag auf dieser Seite war schon aelter als
+            # SEASON_START -> alles Weitere ist noch aelter, hier aufhoeren.
+            break
+
         seen_page_sizes.add(len(items))
         start += len(items)
         time.sleep(REQUEST_PAUSE_SECONDS)
@@ -199,7 +227,10 @@ def get_manager_transfers(token: str, league_id: str, manager_id: str) -> list[d
         if seen_page_sizes and len(items) < max(seen_page_sizes):
             break
 
-    return transfers
+    # Sicherheits-Filter: stellt sicher, dass wirklich nur Transfers ab
+    # SEASON_START zurueckgegeben werden, auch falls die Annahme "neueste
+    # zuerst" doch nicht ueberall zutreffen sollte.
+    return [t for t in transfers if t.get("dt", "") >= SEASON_START]
 
 
 def _auth_headers(token: str) -> dict[str, str]:
