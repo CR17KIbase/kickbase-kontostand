@@ -176,15 +176,21 @@ def get_my_budget(token: str, league_id: str) -> Optional[int]:
     return None
 
 
-def get_manager_transfers(token: str, league_id: str, manager_id: str) -> list[dict[str, Any]]:
+def get_manager_transfers(
+    token: str, league_id: str, manager_id: str, apply_season_filter: bool = True
+) -> list[dict[str, Any]]:
     """
-    Holt die komplette (paginierte) Transferhistorie eines Managers und filtert
-    dabei alles vor SEASON_START heraus (Transfers aus einer Vorsaison).
+    Holt die (paginierte) Transferhistorie eines Managers.
 
-    Die Eintraege kommen absteigend chronologisch (neueste zuerst) - sobald wir
-    also den ersten Eintrag vor SEASON_START sehen, koennen wir das Blaettern
-    komplett abbrechen, weil alles Weitere noch aelter waere. Das spart auch
-    unnoetige Anfragen an die Kickbase-API.
+    apply_season_filter=True (Standard): alles vor SEASON_START wird verworfen
+    (Transfers aus einer Vorsaison, die den aktuellen Kontostand nicht mehr
+    beeinflussen). Die Eintraege kommen absteigend chronologisch (neueste
+    zuerst) - sobald der erste Eintrag vor SEASON_START auftaucht, koennen wir
+    das Blaettern abbrechen und sparen unnoetige Anfragen an die API.
+
+    apply_season_filter=False: die komplette Historie ueber alle Saisons. Das
+    wird fuer die Kauf/Verkauf-Bestimmung gebraucht, weil ein Spieler, den du
+    heute besitzt, durchaus schon in der Vorsaison gekauft worden sein kann.
     """
     transfers: list[dict[str, Any]] = []
     start = 0
@@ -207,13 +213,15 @@ def get_manager_transfers(token: str, league_id: str, manager_id: str) -> list[d
         if not items:
             break
 
-        in_season = [t for t in items if t.get("dt", "") >= SEASON_START]
-        transfers.extend(in_season)
-
-        if len(in_season) < len(items):
-            # Mindestens ein Eintrag auf dieser Seite war schon aelter als
-            # SEASON_START -> alles Weitere ist noch aelter, hier aufhoeren.
-            break
+        if apply_season_filter:
+            in_season = [t for t in items if t.get("dt", "") >= SEASON_START]
+            transfers.extend(in_season)
+            if len(in_season) < len(items):
+                # Mindestens ein Eintrag auf dieser Seite war schon aelter als
+                # SEASON_START -> alles Weitere ist noch aelter, hier aufhoeren.
+                break
+        else:
+            transfers.extend(items)
 
         seen_page_sizes.add(len(items))
         start += len(items)
@@ -224,10 +232,25 @@ def get_manager_transfers(token: str, league_id: str, manager_id: str) -> list[d
         if seen_page_sizes and len(items) < max(seen_page_sizes):
             break
 
-    # Sicherheits-Filter: stellt sicher, dass wirklich nur Transfers ab
-    # SEASON_START zurueckgegeben werden, auch falls die Annahme "neueste
-    # zuerst" doch nicht ueberall zutreffen sollte.
-    return [t for t in transfers if t.get("dt", "") >= SEASON_START]
+    if apply_season_filter:
+        # Sicherheits-Filter: stellt sicher, dass wirklich nur Transfers ab
+        # SEASON_START zurueckgegeben werden, auch falls die Annahme "neueste
+        # zuerst" doch nicht ueberall zutreffen sollte.
+        return [t for t in transfers if t.get("dt", "") >= SEASON_START]
+    return transfers
+
+
+def get_squad_player_ids(token: str, league_id: str, manager_id: str) -> set[str]:
+    """Liefert die Spieler-IDs, die dieser Manager AKTUELL besitzt."""
+    resp = requests.get(
+        f"{BASE_URL}/v4/leagues/{league_id}/managers/{manager_id}/squad",
+        headers=_auth_headers(token),
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        print(f"  [Warnung] Kaderabruf fehlgeschlagen (Status {resp.status_code})")
+        return set()
+    return {p.get("pi") for p in resp.json().get("it", []) if p.get("pi")}
 
 
 def _auth_headers(token: str) -> dict[str, str]:
@@ -248,6 +271,89 @@ def send_telegram_message(bot_token: str, chat_id: str, text: str) -> None:
 # ---------------------------------------------------------------------------
 # Kalibrierung
 # ---------------------------------------------------------------------------
+
+def determine_signs_by_ownership(
+    full_transfers: list[dict[str, Any]], owned_player_ids: set[str]
+) -> Optional[dict[Any, int]]:
+    """
+    Bestimmt BEWEISBAR, welcher tty-Wert ein Kauf und welcher ein Verkauf ist.
+
+    Logik: Wenn ein Spieler HEUTE in deinem Kader steht, dann muss dein
+    juengster Transfer mit genau diesem Spieler ein KAUF gewesen sein - sonst
+    wuerde er dir ja nicht gehoeren. Umgekehrt: gehoert er dir heute nicht mehr,
+    obwohl er in deiner Historie auftaucht, war dein juengster Transfer mit ihm
+    ein VERKAUF.
+
+    Beide Richtungen liefern unabhaengige Belege. Stimmen sie ueberein, ist die
+    Zuordnung eindeutig bewiesen - ganz ohne statistische Annahmen.
+
+    Rueckgabe: {tty_kauf: -1, tty_verkauf: +1} (Kauf kostet Geld, Verkauf bringt
+    Geld) oder None, wenn sich keine eindeutige Aussage treffen laesst.
+    """
+    # Juengster Transfer je Spieler (Liste ist neueste-zuerst sortiert)
+    latest_per_player: dict[str, dict[str, Any]] = {}
+    for t in full_transfers:
+        pi = t.get("pi")
+        if pi and pi not in latest_per_player:
+            latest_per_player[pi] = t
+
+    buy_votes: dict[Any, int] = {}
+    sell_votes: dict[Any, int] = {}
+    buy_examples: list[str] = []
+    sell_examples: list[str] = []
+
+    for pi, t in latest_per_player.items():
+        tty = t.get("tty")
+        if tty is None:
+            continue
+        name = t.get("pn", f"Spieler {pi}")
+        betrag = t.get("trp", 0)
+        datum = (t.get("dt") or "")[:10]
+        beleg = f"{name}: {betrag:,.0f} EUR am {datum} (tty={tty})".replace(",", ".")
+        if pi in owned_player_ids:
+            buy_votes[tty] = buy_votes.get(tty, 0) + 1
+            if len(buy_examples) < 3:
+                buy_examples.append(beleg)
+        else:
+            sell_votes[tty] = sell_votes.get(tty, 0) + 1
+            if len(sell_examples) < 3:
+                sell_examples.append(beleg)
+
+    print(f"  Belege KAUF  (Spieler heute im Kader):     {dict(buy_votes)}")
+    for b in buy_examples:
+        print(f"     z.B. {b}")
+    print(f"  Belege VERKAUF (Spieler heute nicht mehr da): {dict(sell_votes)}")
+    for b in sell_examples:
+        print(f"     z.B. {b}")
+
+    if not buy_votes:
+        print("  [!] Keine Kauf-Belege gefunden (kein Spieler aus der Historie im aktuellen Kader).")
+        return None
+
+    buy_tty = max(buy_votes, key=lambda k: buy_votes[k])
+
+    # Sauberkeitspruefung: der als "Kauf" bestimmte Typ sollte bei den
+    # Verkaufs-Belegen deutlich seltener vorkommen als der andere Typ.
+    if len(buy_votes) > 1:
+        anteil = buy_votes[buy_tty] / sum(buy_votes.values())
+        print(f"  [!] Achtung: die Kauf-Belege sind nicht eindeutig "
+              f"({anteil:.0%} entfallen auf tty={buy_tty}).")
+        if anteil < 0.8:
+            print("  [!] Zu uneindeutig - falle auf das statistische Verfahren zurueck.")
+            return None
+
+    sell_candidates = [k for k in list(buy_votes) + list(sell_votes) if k != buy_tty]
+    if not sell_candidates:
+        print("  [!] Nur ein einziger Transfer-Typ vorhanden - Verkaufs-Typ unbekannt.")
+        return None
+
+    sell_tty = max(set(sell_candidates), key=lambda k: sell_votes.get(k, 0))
+
+    mapping = {buy_tty: -1, sell_tty: 1}
+    print(f"  ==> BEWIESEN: tty={buy_tty} ist KAUF (Geld ab), "
+          f"tty={sell_tty} ist VERKAUF (Geld drauf).")
+    return mapping
+
 
 def initial_calibration(
     my_transfers: list[dict[str, Any]],
@@ -374,6 +480,13 @@ def main() -> None:
     print("Hole deine eigene Transferhistorie ...")
     my_transfers = get_manager_transfers(token, league_id, my_user_id)
 
+    print("Bestimme Kauf/Verkauf anhand deines aktuellen Kaders ...")
+    my_full_transfers = get_manager_transfers(token, league_id, my_user_id, apply_season_filter=False)
+    my_owned = get_squad_player_ids(token, league_id, my_user_id)
+    print(f"  Dein Kader umfasst aktuell {len(my_owned)} Spieler; "
+          f"deine Historie {len(my_full_transfers)} Transfers (alle Saisons).")
+    proven_mapping = determine_signs_by_ownership(my_full_transfers, my_owned)
+
     print("Hole Transferhistorie aller anderen Teilnehmer ...")
     other_transfers_by_manager: dict[str, list[dict[str, Any]]] = {}
     for m in managers:
@@ -382,15 +495,19 @@ def main() -> None:
             continue
         other_transfers_by_manager[manager_id] = get_manager_transfers(token, league_id, manager_id)
 
-    # Kalibrierung laeuft bei JEDEM Lauf frisch. Der aufgelaufene Bonus ergibt
-    # sich dabei automatisch aus deinem AKTUELLEN echten Kontostand - er ist
-    # damit immer auf dem neuesten Stand, egal wie sich der taegliche Bonus
-    # entwickelt (80k, 90k, 100k pro Tag oder beliebig anders). Ein
-    # Zwischenspeicher zwischen den Laeufen ist dafuer nicht noetig.
-    print("Fuehre Kalibrierung durch (Vorzeichen + aufgelaufener Bonus) ...")
-    sign_mapping, known_total_bonus = initial_calibration(
-        my_transfers, my_real_budget, other_transfers_by_manager
-    )
+    if proven_mapping is not None:
+        sign_mapping = proven_mapping
+        my_signed_sum = sum(
+            sign_mapping.get(t.get("tty"), 0) * t.get("trp", 0) for t in my_transfers
+        )
+        known_total_bonus = my_real_budget - STARTBUDGET - my_signed_sum
+        print(f"Aufgelaufener Bonus (aus deinem echten Kontostand abgeleitet): "
+              f"{known_total_bonus:,.0f} EUR".replace(",", "."))
+    else:
+        print("Kauf/Verkauf liess sich nicht beweisen - nutze das statistische Verfahren ...")
+        sign_mapping, known_total_bonus = initial_calibration(
+            my_transfers, my_real_budget, other_transfers_by_manager
+        )
 
     print("\nErstelle Ergebnis-Tabelle ...\n")
     results = []
