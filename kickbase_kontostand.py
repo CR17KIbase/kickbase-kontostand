@@ -46,8 +46,19 @@ Bonus bei jedem Lauf live:
 
 Dafuer muss das Skript sich Daten zwischen zwei Laeufen merken (gespeichert in
 kickbase_state.json). Beim allerersten Lauf (noch kein gespeicherter Zustand)
-wird einmalig eine Anfangs-Kalibrierung anhand der bisherigen Transferhistorie
-durchgefuehrt (Details siehe initial_calibration()).
+wird einmalig eine Anfangs-Kalibrierung durchgefuehrt (Details siehe
+initial_calibration()).
+
+WICHTIG zur Vorzeichen-Zuordnung (Kauf vs. Verkauf):
+Die API sagt nirgendwo, ob Transfer-Typ 1 ein Kauf oder ein Verkauf ist. Das
+laesst sich NICHT allein aus deinen eigenen Daten herleiten, weil der Bonus ein
+freier, unbekannter Parameter ist - rechnerisch passt JEDE Vorzeichen-Wahl exakt
+zu deinem eigenen Kontostand (man waehlt den Bonus einfach passend dazu).
+Deshalb nutzt die Kalibrierung die GESAMTE LIGA: von den moeglichen Vorzeichen-
+Kombinationen wird diejenige gewaehlt, bei der die geschaetzten Kontostaende
+aller Teilnehmer am plausibelsten zusammenliegen (kleinste Streuung) - in einer
+jungen Liga mit gleichem Startbudget sollten die Kontostaende nicht um hunderte
+Millionen Euro auseinanderliegen.
 
 EINRICHTUNG (lokal)
 -------------------
@@ -238,51 +249,78 @@ def save_state(state: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 def initial_calibration(
-    transfers: list[dict[str, Any]], real_budget: int
+    my_transfers: list[dict[str, Any]],
+    my_real_budget: int,
+    other_transfers_by_manager: dict[str, list[dict[str, Any]]],
 ) -> tuple[dict[Any, int], int]:
     """
     Nur beim ALLERERSTEN Lauf (noch kein gespeicherter Zustand vorhanden).
 
-    Findet per Brute-Force die plausibelste Vorzeichen-Zuordnung pro
-    Transfer-Typ ('tty': Kauf oder Verkauf?) UND den daraus resultierenden,
-    bislang aufgelaufenen Gesamt-Bonus. Da der Bonus nicht mehr als fixer Wert
-    bekannt ist, waehlen wir unter allen moeglichen Vorzeichen-Kombinationen
-    diejenige, die einen plausiblen (kleinen, nicht-negativen) Bonus uebrig
-    laesst - eine falsche Vorzeichen-Zuordnung fuehrt ueblicherweise zu einem
-    stark verzerrten (z.B. stark negativen oder utopisch hohen) Ergebnis, weil
-    sich der Fehler ueber alle bisherigen Transfers aufsummiert.
+    Ermittelt die plausibelste Vorzeichen-Zuordnung pro Transfer-Typ ('tty':
+    Kauf oder Verkauf?). WICHTIG: das laesst sich NICHT allein aus den eigenen
+    Daten bestimmen, weil der (unbekannte) Bonus ein freier Parameter ist -
+    jede Vorzeichen-Kombination laesst sich mit einem passend gewaehlten Bonus
+    exakt an den eigenen echten Kontostand anpassen (das war der Fehler in der
+    Vorgaengerversion). Stattdessen nutzen wir die GESAMTE LIGA: fuer jede
+    moegliche Kombination berechnen wir die geschaetzten Kontostaende ALLER
+    anderen Teilnehmer und waehlen die Kombination, bei der diese Schaetzungen
+    am plausibelsten zusammen liegen (kleinste Streuung/Spannweite) - in einer
+    jungen Liga mit gleichem Startbudget sollten die Kontostaende nicht um
+    hunderte Millionen Euro auseinanderliegen.
 
     Ab dem naechsten Lauf wird der Bonus dann nicht mehr geschaetzt, sondern
     live aus der Differenz deines echten Kontostands gemessen (siehe main()).
+    Die Vorzeichen-Zuordnung selbst bleibt danach unveraendert (Annahme:
+    strukturelle API-Eigenschaft, aendert sich nicht im Saisonverlauf).
     """
-    distinct_types = sorted({t.get("tty") for t in transfers if "tty" in t})
+    distinct_types = sorted({t.get("tty") for t in my_transfers if "tty" in t})
     if not distinct_types:
-        # Noch keine Transfers (z.B. ganz neue Liga) - Vorzeichen noch nicht
-        # bestimmbar, aber auch noch nicht relevant.
-        return {}, max(real_budget - STARTBUDGET, 0)
+        # Noch keine eigenen Transfers - Vorzeichen noch nicht bestimmbar,
+        # aber auch noch nicht relevant.
+        return {}, max(my_real_budget - STARTBUDGET, 0)
 
     candidates = []
     for signs in itertools.product([1, -1], repeat=len(distinct_types)):
         mapping = dict(zip(distinct_types, signs))
-        signed_sum = sum(mapping[t.get("tty")] * t.get("trp", 0) for t in transfers)
-        implied_bonus = real_budget - STARTBUDGET - signed_sum
-        candidates.append((mapping, implied_bonus))
+        my_signed_sum = sum(mapping.get(t.get("tty"), 0) * t.get("trp", 0) for t in my_transfers)
+        implied_bonus = my_real_budget - STARTBUDGET - my_signed_sum
 
-    print("  Kandidaten fuer Vorzeichen-Zuordnung (tty -> Vorzeichen | impliziter Bonus):")
-    for mapping, implied_bonus in candidates:
+        other_budgets = [
+            estimate_budget(transfers, mapping, implied_bonus)
+            for transfers in other_transfers_by_manager.values()
+        ]
+        spread = (max(other_budgets) - min(other_budgets)) if other_budgets else 0
+        candidates.append((mapping, implied_bonus, spread, other_budgets))
+
+    print("  Kandidaten fuer Vorzeichen-Zuordnung "
+          "(tty -> Vorzeichen | impliziter Bonus | Streuung ueber die Liga):")
+    for mapping, implied_bonus, spread, _ in candidates:
         bonus_str = f"{implied_bonus:,.0f}".replace(",", ".")
-        print(f"    {mapping} -> {bonus_str} EUR")
+        spread_str = f"{spread:,.0f}".replace(",", ".")
+        print(f"    {mapping} -> Bonus {bonus_str} EUR | Streuung {spread_str} EUR")
 
-    # Plausibelster Kandidat: kleinster nicht-negativer impliziter Bonus.
-    non_negative = [c for c in candidates if c[1] >= 0]
-    pool = non_negative if non_negative else candidates
-    best_mapping, best_bonus = min(pool, key=lambda c: abs(c[1]))
+    # Wichtiger Sonderfall: eine Vorzeichen-Kombination und ihre komplette
+    # Umkehrung (z.B. {1:+1,2:-1} vs. {1:-1,2:+1}) liefern IMMER exakt dieselbe
+    # Streuung (mathematisch beweisbar - die Umkehrung spiegelt nur alle
+    # Abweichungen um deinen eigenen Kontostand, die Spannweite bleibt gleich).
+    # Bei einem Gleichstand entscheidet deshalb zusaetzlich die Plausibilitaet
+    # des Bonus: ein Bonus sollte nicht negativ sein.
+    min_spread = min(c[2] for c in candidates)
+    tied = [c for c in candidates if c[2] == min_spread]
+    if len(tied) > 1:
+        non_negative = [c for c in tied if c[1] >= 0]
+        pool = non_negative if non_negative else tied
+        best_mapping, best_bonus, best_spread, _ = min(pool, key=lambda c: abs(c[1]))
+        print(f"  [Hinweis] {len(tied)} Kandidaten mit identischer Streuung gefunden - "
+              "Bonus-Plausibilitaet (nicht negativ) hat entschieden.")
+    else:
+        best_mapping, best_bonus, best_spread, _ = tied[0]
 
-    print("  -> Gewaehlt (kleinster plausibler Bonus): "
-          f"{best_mapping} -> {best_bonus:,.0f} EUR".replace(",", "."))
-    print("  [Hinweis] Bitte beim allerersten Lauf kurz gegenchecken, ob dieser Wert plausibel")
-    print("  wirkt (z.B. nicht viel groesser als ein paar hunderttausend Euro, falls die Saison")
-    print("  gerade erst beginnt). Falls nicht, sag mir die Kandidatenliste oben, ich korrigiere es.")
+    print(f"  -> Gewaehlt: {best_mapping} -> "
+          f"Bonus {best_bonus:,.0f} EUR, Streuung {best_spread:,.0f} EUR".replace(",", "."))
+    print("  [Hinweis] Bitte beim allerersten Lauf kurz gegenchecken, ob die resultierenden")
+    print("  Kontostaende in der Tabelle unten plausibel wirken (aehnliche Groessenordnung,")
+    print("  keine utopischen Werte). Falls nicht, sag mir die Kandidatenliste oben.")
 
     return best_mapping, best_bonus
 
@@ -336,11 +374,19 @@ def main() -> None:
     my_transfers = get_manager_transfers(token, league_id, my_user_id)
     my_fingerprints = {transfer_fingerprint(t) for t in my_transfers}
 
+    print("Hole Transferhistorie aller anderen Teilnehmer ...")
+    other_transfers_by_manager: dict[str, list[dict[str, Any]]] = {}
+    for m in managers:
+        manager_id = m.get("i")
+        if manager_id == my_user_id:
+            continue
+        other_transfers_by_manager[manager_id] = get_manager_transfers(token, league_id, manager_id)
+
     state = load_state()
 
     if state is None:
         print("Kein gespeicherter Zustand gefunden (erster Lauf) - fuehre Anfangs-Kalibrierung durch ...")
-        sign_mapping, known_total_bonus = initial_calibration(my_transfers, my_real_budget)
+        sign_mapping, known_total_bonus = initial_calibration(my_transfers, my_real_budget, other_transfers_by_manager)
     else:
         print("Gespeicherten Zustand aus letztem Lauf geladen - messe Bonus-Zuwachs live ...")
         sign_mapping = dict(state.get("sign_mapping", []))
@@ -359,7 +405,7 @@ def main() -> None:
         print(f"  Bonus-Zuwachs seit letztem Lauf: {bonus_delta:,.0f} EUR".replace(",", "."))
         print(f"  Neuer Gesamt-Bonus (dynamisch, seit Ligastart): {known_total_bonus:,.0f} EUR".replace(",", "."))
 
-    print("Hole Transferhistorie aller Teilnehmer ...\n")
+    print("\nErstelle Ergebnis-Tabelle ...\n")
     results = []
     for m in managers:
         manager_id = m.get("i")
@@ -371,7 +417,7 @@ def main() -> None:
             est_budget = my_real_budget
             note = "(echter Wert)"
         else:
-            transfers = get_manager_transfers(token, league_id, manager_id)
+            transfers = other_transfers_by_manager.get(manager_id, [])
             est_budget = estimate_budget(transfers, sign_mapping, known_total_bonus)
             note = "(geschaetzt)"
 
