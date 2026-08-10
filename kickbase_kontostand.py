@@ -415,6 +415,11 @@ def main() -> None:
 
     state = load_state()
 
+    force_recal = os.environ.get("FORCE_RECALIBRATION", "").strip().lower() in ("1", "true", "yes", "ja")
+    if force_recal and state is not None:
+        print("FORCE_RECALIBRATION gesetzt - verwerfe gespeicherten Zustand und kalibriere neu.")
+        state = None
+
     if state is None:
         print("Kein gespeicherter Zustand gefunden (erster Lauf) - fuehre Anfangs-Kalibrierung durch ...")
         sign_mapping, known_total_bonus = initial_calibration(my_transfers, my_real_budget, other_transfers_by_manager)
