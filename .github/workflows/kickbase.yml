@@ -1,0 +1,47 @@
+name: Kickbase Kontostand
+
+on:
+  schedule:
+    # Laeuft alle 15 Minuten (UTC-Zeit). Kann spaeter angepasst werden,
+    # z.B. auf "*/5 * * * *" fuer alle 5 Minuten (kuerzeres Intervall
+    # wird von GitHub Actions nicht garantiert unterstuetzt).
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}   # erlaubt manuelles Starten ueber den "Run workflow"-Button
+
+jobs:
+  kontostand:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Abhaengigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Gespeicherten Zustand wiederherstellen (fuer dynamischen Bonus)
+        uses: actions/cache/restore@v4
+        with:
+          path: kickbase_state.json
+          key: kickbase-state-${{ github.run_id }}
+          restore-keys: |
+            kickbase-state-
+
+      - name: Skript ausfuehren
+        env:
+          KICKBASE_EMAIL: ${{ secrets.KICKBASE_EMAIL }}
+          KICKBASE_PASSWORD: ${{ secrets.KICKBASE_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 kickbase_kontostand.py
+
+      - name: Zustand fuer naechsten Lauf sichern
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: kickbase_state.json
+          key: kickbase-state-${{ github.run_id }}
