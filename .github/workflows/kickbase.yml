@@ -27,9 +27,13 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: kickbase_state.json
-          key: kickbase-state-${{ github.run_id }}
+          # "v2": bewusst neuer Prefix, damit der fehlerhafte Zustand aus dem
+          # allerersten Testlauf (mit der alten, falschen Vorzeichen-Logik)
+          # nicht wiederverwendet wird - so startet die Kalibrierung einmalig
+          # sauber neu.
+          key: kickbase-state-v2-${{ github.run_id }}
           restore-keys: |
-            kickbase-state-
+            kickbase-state-v2-
 
       - name: Skript ausfuehren
         env:
@@ -37,11 +41,13 @@ jobs:
           KICKBASE_PASSWORD: ${{ secrets.KICKBASE_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python3 kickbase_kontostand.py
+        # "-u" = unbuffered, damit die Ausgabe live im Protokoll erscheint
+        # statt erst gesammelt am Ende.
+        run: python3 -u kickbase_kontostand.py
 
       - name: Zustand fuer naechsten Lauf sichern
         if: success()
         uses: actions/cache/save@v4
         with:
           path: kickbase_state.json
-          key: kickbase-state-${{ github.run_id }}
+          key: kickbase-state-v2-${{ github.run_id }}
