@@ -1,32 +1,29 @@
 #!/usr/bin/env python3
 """
-DIAGNOSE 2: Liefert die API die Kontostaende der anderen vielleicht direkt?
-===========================================================================
+DIAGNOSE 3: Ist der Kontostand = Rangliste-tv minus Dashboard-tv?
+==================================================================
 
-Ausgangslage nach Diagnose 1:
-  - Der Activity-Feed reicht nur ~2,5 Wochen zurueck, nicht bis zum Saisonstart.
-  - Der Tagesbonus (aktuell 100.000 EUR) steht dort ohne Nutzer-ID, gilt also
-    offenbar ligaweit gleich.
-  - Spieltagspraemien tauchen im Feed NICHT mit Betraegen auf.
+Beobachtung aus Diagnose 2: Fuer denselben Manager liefern zwei Endpunkte
+unterschiedliche "tv"-Werte:
+    Rangliste: 215.794.865
+    Dashboard: 205.852.562
+    Differenz:   9.942.303   <- sieht nach einem Kontostand aus
 
-Bevor wir eine Praemienformel rekonstruieren (fehleranfaellig), pruefen wir das
-Naheliegende: Vielleicht steht der Kontostand anderer Manager laengst irgendwo
-in der API.
+VERMUTUNG: Die Rangliste zeigt das Gesamtvermoegen (Teamwert + Kontostand),
+das Dashboard nur den reinen Teamwert. Dann waere:
 
-DER TRICK: Deinen EIGENEN Kontostand kennen wir exakt (aus /me/budget). Dieses
-Skript ruft ihn ab und durchsucht dann alle in Frage kommenden Endpunkte
-rekursiv nach genau diesem Zahlenwert. Taucht er irgendwo auf, wissen wir
-zweifelsfrei, welches Feld der Kontostand ist - und koennen ihn danach fuer
-ALLE Manager direkt auslesen, ohne jede Schaetzung.
+    Kontostand = Rangliste-tv - Dashboard-tv
 
-Zusaetzlich werden die Rohstrukturen ausgegeben, damit wir sehen, welche
-weiteren Kennzahlen (z.B. Teamwert) verfuegbar sind.
+Waere das richtig, braeuchten wir KEINE Berechnung mehr: keine Transfers, keine
+Boni, keine Spieltagspraemien, keine Annahmen. Wir wuerden die echten
+Kontostaende einfach auslesen.
 
-DATENSCHUTZ: Das Actions-Protokoll ist oeffentlich lesbar. Namen und IDs
-anderer Manager werden pseudonymisiert (Manager A, B, C ...).
+BEWEIS: Deinen eigenen Kontostand kennen wir exakt (/me/budget). Wenn die Formel
+bei DIR auf den Euro genau stimmt, gilt sie auch fuer die anderen.
+
+DATENSCHUTZ: Namen und IDs werden pseudonymisiert (das Log ist oeffentlich).
 """
 
-import json
 import os
 import sys
 import time
@@ -48,159 +45,91 @@ def anon(v: Any) -> str:
     return _alias[k]
 
 
-def scrub(obj: Any) -> Any:
-    """Pseudonymisiert Personenfelder und entfernt Bild-URLs (rein visuelles Rauschen)."""
-    personen = {"u", "unm", "byr", "slr", "buid", "slid", "usr", "uid", "n", "ln", "fn", "pn"}
-    weg = {"uim", "lim", "plpim", "pim", "tim", "im"}
-    if isinstance(obj, dict):
-        out = {}
-        for k, v in obj.items():
-            if k in weg:
-                continue
-            if k in personen and not isinstance(v, (dict, list)):
-                out[k] = anon(v)
-            else:
-                out[k] = scrub(v)
-        return out
-    if isinstance(obj, list):
-        return [scrub(x) for x in obj]
-    return obj
-
-
-def suche_wert(obj: Any, ziel: float, pfad: str = "") -> list[str]:
-    """Durchsucht eine JSON-Struktur rekursiv nach einem Zahlenwert und gibt die Fundpfade zurueck."""
-    treffer: list[str] = []
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            treffer += suche_wert(v, ziel, f"{pfad}.{k}")
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            treffer += suche_wert(v, ziel, f"{pfad}[{i}]")
-    elif isinstance(obj, (int, float)) and not isinstance(obj, bool):
-        if abs(float(obj) - ziel) < 0.5:
-            treffer.append(pfad or "<wurzel>")
-    return treffer
-
-
-def hole(url: str, headers: dict, params: dict | None = None) -> tuple[int, Any]:
-    try:
-        r = requests.get(url, headers=headers, params=params or {}, timeout=20)
-        time.sleep(0.3)
-        if r.status_code != 200:
-            return r.status_code, None
-        return 200, r.json()
-    except Exception as exc:  # Netzwerk-/JSON-Fehler sollen die Diagnose nicht abbrechen
-        print(f"    [Fehler] {type(exc).__name__}: {exc}")
-        return -1, None
+def eur(x: float | None) -> str:
+    return "?" if x is None else f"{x:,.0f}".replace(",", ".")
 
 
 def main() -> None:
-    email = os.environ.get("KICKBASE_EMAIL")
-    password = os.environ.get("KICKBASE_PASSWORD")
+    email, password = os.environ.get("KICKBASE_EMAIL"), os.environ.get("KICKBASE_PASSWORD")
     if not email or not password:
-        print("KICKBASE_EMAIL / KICKBASE_PASSWORD fehlen.")
-        sys.exit(1)
+        print("KICKBASE_EMAIL / KICKBASE_PASSWORD fehlen."); sys.exit(1)
 
     r = requests.post(f"{BASE_URL}/v4/user/login",
                       json={"em": email, "pass": password, "loy": False, "rep": {}},
                       headers={"Accept": "application/json"}, timeout=15)
-    print(f"[LOGIN] Status: {r.status_code}")
     if r.status_code != 200:
-        print(r.text[:300]); sys.exit(1)
-
+        print(f"[LOGIN] Status {r.status_code}: {r.text[:300]}"); sys.exit(1)
     login = r.json()
-    token = login["tkn"]
+    h = {"Authorization": f"Bearer {login['tkn']}", "Accept": "application/json"}
     me = str(login["u"]["id"])
-    h = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     _alias[me] = "DU"
     lid = LEAGUE_ID
 
-    # --- Mein exakter Kontostand als Suchmuster --------------------------
-    st, bud = hole(f"{BASE_URL}/v4/leagues/{lid}/me/budget", h)
-    mein_budget = None
-    if st == 200:
-        mein_budget = bud if isinstance(bud, (int, float)) else next(
-            (bud[k] for k in ("b", "budget", "bg") if isinstance(bud, dict) and k in bud), None)
-    print(f"Dein Kontostand (Suchmuster): {mein_budget}")
-    if mein_budget is None:
-        print("!! Ohne bekannten Kontostand ist die Suche sinnlos.")
-        sys.exit(1)
+    # Reihenfolge wichtig: erst Rangliste, dann Budget, dann Dashboards -
+    # die Werte sollen moeglichst aus demselben Moment stammen.
+    rr = requests.get(f"{BASE_URL}/v4/leagues/{lid}/ranking", headers=h, timeout=20)
+    ranking = rr.json().get("us", []) if rr.status_code == 200 else []
 
-    # --- Ranking: welche Manager gibt es? --------------------------------
-    st, ranking = hole(f"{BASE_URL}/v4/leagues/{lid}/ranking", h)
-    managers = (ranking or {}).get("us", [])
-    andere = [str(m.get("i")) for m in managers if str(m.get("i")) != me]
-    print(f"Manager in der Liga: {len(managers)} (davon andere: {len(andere)})")
+    rb = requests.get(f"{BASE_URL}/v4/leagues/{lid}/me/budget", headers=h, timeout=15)
+    d = rb.json() if rb.status_code == 200 else {}
+    mein_budget = d if isinstance(d, (int, float)) else next(
+        (d[k] for k in ("b", "budget", "bg") if isinstance(d, dict) and k in d), None)
+    print(f"Dein echter Kontostand (/me/budget): {eur(mein_budget)} EUR\n")
 
-    # --- Kandidaten-Endpunkte durchsuchen --------------------------------
-    ein_anderer = andere[0] if andere else me
-    kandidaten = [
-        ("ranking",                f"{BASE_URL}/v4/leagues/{lid}/ranking", None),
-        ("overview",               f"{BASE_URL}/v4/leagues/{lid}/overview",
-                                   {"includeManagersAndBattles": "true"}),
-        ("me",                     f"{BASE_URL}/v4/leagues/{lid}/me", None),
-        ("settings/managers",      f"{BASE_URL}/v4/leagues/{lid}/settings/managers", None),
-        ("dashboard (DU)",         f"{BASE_URL}/v4/leagues/{lid}/managers/{me}/dashboard", None),
-        ("dashboard (anderer)",    f"{BASE_URL}/v4/leagues/{lid}/managers/{ein_anderer}/dashboard", None),
-        ("teamcenter (anderer)",   f"{BASE_URL}/v4/leagues/{lid}/users/{ein_anderer}/teamcenter", None),
-        ("squad (anderer)",        f"{BASE_URL}/v4/leagues/{lid}/managers/{ein_anderer}/squad", None),
-    ]
+    print("=" * 88)
+    print(f"{'Manager':<12}{'Rangliste tv':>18}{'Dashboard tv':>18}{'Differenz':>16}{'prft':>18}")
+    print("=" * 88)
 
-    print("\n" + "=" * 70)
-    print(f"[1] SUCHE nach dem Wert {mein_budget:,.0f} in allen Endpunkten".replace(",", "."))
-    print("=" * 70)
-    fundstellen: list[tuple[str, str]] = []
-    rohdaten: dict[str, Any] = {}
-    for name, url, params in kandidaten:
-        st, data = hole(url, h, params)
-        if st != 200 or data is None:
-            print(f"  {name:<22} Status {st} - uebersprungen")
+    zeilen = []
+    for m in ranking:
+        mid = str(m.get("i"))
+        rank_tv = m.get("tv")
+        rd = requests.get(f"{BASE_URL}/v4/leagues/{lid}/managers/{mid}/dashboard",
+                          headers=h, timeout=15)
+        time.sleep(0.3)
+        if rd.status_code != 200:
+            print(f"{anon(mid):<12} Dashboard-Status {rd.status_code}")
             continue
-        rohdaten[name] = data
-        tref = suche_wert(data, float(mein_budget))
-        if tref:
-            print(f"  {name:<22} TREFFER an: {tref}")
-            fundstellen += [(name, t) for t in tref]
-        else:
-            print(f"  {name:<22} kein Treffer")
+        dash = rd.json()
+        dash_tv = dash.get("tv")
+        diff = (rank_tv - dash_tv) if (rank_tv is not None and dash_tv is not None) else None
+        zeilen.append((mid, rank_tv, dash_tv, diff))
+        print(f"{anon(mid):<12}{eur(rank_tv):>18}{eur(dash_tv):>18}{eur(diff):>16}"
+              f"{eur(dash.get('prft')):>18}")
 
+    print("=" * 88)
+
+    # ---- Der eigentliche Beweis ----------------------------------------
     print("\n" + "-" * 70)
-    if fundstellen:
-        print("  ==> GEFUNDEN! Der Kontostand steht in der API. Relevante Stellen:")
-        for name, pfad in fundstellen:
-            print(f"      {name}: {pfad}")
-        print("  Wenn eine dieser Stellen auch fuer ANDERE Manager gefuellt ist,")
-        print("  brauchen wir keine Schaetzung mehr - dann lesen wir sie direkt aus.")
-    else:
-        print("  ==> Nirgends gefunden. Der Kontostand anderer Manager ist also")
-        print("      nicht direkt abrufbar; wir muessen ihn weiter berechnen.")
+    print("  BEWEIS an deinen eigenen Daten")
     print("-" * 70)
-
-    # --- Rohstrukturen zeigen -------------------------------------------
-    print("\n" + "=" * 70)
-    print("[2] ROHSTRUKTUREN (gekuerzt) - welche Kennzahlen gibt es ueberhaupt?")
-    print("=" * 70)
-    for name in ("ranking", "overview", "dashboard (DU)", "dashboard (anderer)",
-                 "teamcenter (anderer)"):
-        if name not in rohdaten:
-            continue
-        print(f"\n--- {name} ---")
-        print(json.dumps(scrub(rohdaten[name]), ensure_ascii=False, indent=1)[:1800])
-
-    # --- Ranking je Manager im Klartext ----------------------------------
-    if managers:
-        print("\n" + "=" * 70)
-        print("[3] RANKING-FELDER je Manager (zum Abgleich mit der App)")
-        print("=" * 70)
-        print(f"  Felder eines Ranking-Eintrags: {sorted(managers[0].keys())}")
-        for m in managers:
-            zahlen = {k: v for k, v in m.items()
-                      if isinstance(v, (int, float)) and not isinstance(v, bool)}
-            print(f"  {anon(m.get('i')):<12} {zahlen}")
-
-    print("\n" + "=" * 70)
-    print("FERTIG - bitte diese Ausgabe zurueckschicken.")
-    print("=" * 70)
+    meine = next((z for z in zeilen if z[0] == me), None)
+    if meine is None or mein_budget is None:
+        print("  Konnte deine Zeile nicht bilden - Beweis nicht moeglich.")
+    else:
+        _, rank_tv, dash_tv, diff = meine
+        print(f"  Rangliste tv:            {eur(rank_tv):>18}")
+        print(f"  Dashboard tv:            {eur(dash_tv):>18}")
+        print(f"  Differenz:               {eur(diff):>18}")
+        print(f"  Dein echter Kontostand:  {eur(mein_budget):>18}")
+        if diff is None:
+            print("  ==> Werte fehlen.")
+        elif abs(diff - mein_budget) < 1:
+            print("\n  ==> BESTAETIGT: Die Differenz IST der Kontostand (exakt).")
+            print("      Damit koennen wir alle Kontostaende direkt auslesen -")
+            print("      ohne Transfers, Boni oder Praemien zu berechnen.")
+        elif abs(diff - mein_budget) < 200_000:
+            print(f"\n  ==> FAST: Abweichung {eur(abs(diff - mein_budget))} EUR.")
+            print("      Vermutlich stammen die beiden Werte aus leicht")
+            print("      unterschiedlichen Momenten (Marktwert-Update).")
+        else:
+            print(f"\n  ==> WIDERLEGT: Abweichung {eur(abs(diff - mein_budget))} EUR.")
+            print("      Die Differenz bedeutet etwas anderes.")
+            if dash_tv is not None:
+                print(f"      Zur Info: Dashboard-tv + dein Kontostand = "
+                      f"{eur(dash_tv + mein_budget)}")
+                print(f"                Rangliste-tv                  = {eur(rank_tv)}")
+    print("-" * 70)
 
 
 if __name__ == "__main__":
