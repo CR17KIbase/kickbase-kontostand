@@ -1,0 +1,27 @@
+name: Kickbase Diagnose
+
+# Laeuft NICHT automatisch - nur manuell per Knopfdruck.
+# Deshalb entstehen hierdurch auch keine Fehler-Mails.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Abhaengigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Diagnose ausfuehren
+        env:
+          KICKBASE_EMAIL: ${{ secrets.KICKBASE_EMAIL }}
+          KICKBASE_PASSWORD: ${{ secrets.KICKBASE_PASSWORD }}
+        run: python3 -u diagnose.py
