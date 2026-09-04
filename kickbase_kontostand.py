@@ -98,6 +98,7 @@ import itertools
 import os
 import sys
 import time
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import requests
@@ -106,7 +107,9 @@ import requests
 # CONFIG - hier anpassen
 # ---------------------------------------------------------------------------
 
-LEAGUE_NAME = "TSV Tiefenbach 25/26"   # muss exakt dem Liganamen in Kickbase entsprechen
+LEAGUE_ID = "5567806"                  # stabile ID eurer Liga - aendert sich bei einer
+                                       # Umbenennung NICHT und wird deshalb zuerst gesucht
+LEAGUE_NAME = "TSV Tiefenbach 26/27"   # nur Rueckfallebene, falls die ID mal nicht passt
 STARTBUDGET = 50_000_000              # Startbudget lt. Liga-Einstellungen (das aendert sich normalerweise nicht)
 SEASON_START = "2026-08-03T00:00:00Z" # Datum des Kontostand-Resets (03.08., Uhrzeit unbekannt ->
                                        # sicherheitshalber Tagesbeginn UTC). Transfers VOR diesem
@@ -134,16 +137,36 @@ def login(email: str, password: str) -> dict[str, Any]:
     return resp.json()
 
 
-def find_league_id(login_data: dict[str, Any], league_name: str) -> str:
+def find_league_id(login_data: dict[str, Any], league_name: str) -> tuple[str, str]:
+    """
+    Findet eure Liga - zuerst ueber die stabile LEAGUE_ID, ersatzweise ueber den
+    Namen. Kickbase benennt Ligen zum Saisonwechsel um (z.B. "25/26" -> "26/27"),
+    die ID bleibt dabei gleich. Deshalb hat die ID Vorrang: so laeuft das Skript
+    auch nach einer Umbenennung ohne Anpassung weiter.
+
+    Rueckgabe: (liga_id, aktueller_liganame)
+    """
     leagues = login_data.get("srvl", [])
+
+    for lg in leagues:
+        if str(lg.get("id", "")) == str(LEAGUE_ID):
+            aktueller_name = lg.get("name", LEAGUE_NAME)
+            if aktueller_name.strip().lower() != league_name.strip().lower():
+                print(f"  [Hinweis] Liga heisst inzwischen {aktueller_name!r} "
+                      f"(im Skript steht {league_name!r}) - ID passt, laeuft weiter.")
+            return str(lg["id"]), aktueller_name
+
     for lg in leagues:
         if lg.get("name", "").strip().lower() == league_name.strip().lower():
-            return lg["id"]
-    available = [lg.get("name") for lg in leagues]
+            print(f"  [Hinweis] Liga ueber den Namen gefunden, ID lautet {lg.get('id')} "
+                  f"- bitte LEAGUE_ID im Skript darauf anpassen.")
+            return str(lg["id"]), lg.get("name", league_name)
+
+    available = [f"{lg.get('name')} (ID {lg.get('id')})" for lg in leagues]
     raise ValueError(
-        f"Liga '{league_name}' nicht in deinem Account gefunden.\n"
+        f"Weder LEAGUE_ID {LEAGUE_ID} noch Liga '{league_name}' in deinem Account gefunden.\n"
         f"Verfuegbare Ligen: {available}\n"
-        f"-> Passe LEAGUE_NAME in den CONFIG-Einstellungen oben im Skript an."
+        f"-> Passe LEAGUE_ID (bevorzugt) oder LEAGUE_NAME in den CONFIG-Einstellungen an."
     )
 
 
@@ -462,8 +485,8 @@ def main() -> None:
     token = login_data["tkn"]
     my_user_id = login_data["u"]["id"]
 
-    league_id = find_league_id(login_data, LEAGUE_NAME)
-    print(f"Liga gefunden: {LEAGUE_NAME} ({league_id})")
+    league_id, league_display_name = find_league_id(login_data, LEAGUE_NAME)
+    print(f"Liga gefunden: {league_display_name} ({league_id})")
 
     print("Hole Rangliste (Namen, Teamwert, Punkte) ...")
     ranking = get_ranking(token, league_id)
@@ -487,6 +510,29 @@ def main() -> None:
           f"deine Historie {len(my_full_transfers)} Transfers (alle Saisons).")
     proven_mapping = determine_signs_by_ownership(my_full_transfers, my_owned)
 
+    # --- Pruefung des Saison-Stichtags --------------------------------------
+    # Wenn der Budget-Reset am 03.08. z.B. erst um 8 Uhr war, gehoeren Transfers
+    # vom Vormittag noch zur ALTEN Saison und duerfen nicht mitgerechnet werden.
+    # Deshalb hier alle Transfers rund um den Stichtag mit Uhrzeit auflisten.
+    stichtag = SEASON_START[:10]
+    tag_davor = (datetime.fromisoformat(stichtag) - timedelta(days=1)).strftime("%Y-%m-%d")
+    tag_danach = (datetime.fromisoformat(stichtag) + timedelta(days=1)).strftime("%Y-%m-%d")
+    umfeld = sorted(
+        (t for t in my_full_transfers if tag_davor <= (t.get("dt") or "")[:10] <= tag_danach),
+        key=lambda t: t.get("dt") or "",
+    )
+    print(f"\n  DEINE Transfers vom {tag_davor} bis {tag_danach} (Stichtag ist {stichtag}):")
+    if not umfeld:
+        print("    (keine) - dann ist die Uhrzeit des Stichtags unkritisch.")
+    else:
+        for t in umfeld:
+            typ = "KAUF   " if proven_mapping and proven_mapping.get(t.get("tty")) == -1 else "VERKAUF"
+            gezaehlt = "GEZAEHLT" if (t.get("dt") or "") >= SEASON_START else "ignoriert"
+            print(f"    {(t.get('dt') or '')[:16].replace('T', ' ')}  {typ}  "
+                  f"{t.get('trp', 0):>12,.0f} EUR  {t.get('pn', '?'):<15} [{gezaehlt}]".replace(",", "."))
+        print("    >>> Falls hier Eintraege VOR dem Reset mit [GEZAEHLT] stehen, muss")
+        print("        SEASON_START oben im Skript auf die echte Uhrzeit gesetzt werden.")
+
     print("Hole Transferhistorie aller anderen Teilnehmer ...")
     other_transfers_by_manager: dict[str, list[dict[str, Any]]] = {}
     for m in managers:
@@ -503,6 +549,18 @@ def main() -> None:
         known_total_bonus = my_real_budget - STARTBUDGET - my_signed_sum
         print(f"Aufgelaufener Bonus (aus deinem echten Kontostand abgeleitet): "
               f"{known_total_bonus:,.0f} EUR".replace(",", "."))
+        # Kontrollrechnung fuer deinen eigenen Kontostand - hier kennen wir die
+        # Wahrheit, also muss die Formel exakt aufgehen.
+        eigene_kaeufe = sum(t.get("trp", 0) for t in my_transfers if sign_mapping.get(t.get("tty")) == -1)
+        eigene_verkaeufe = sum(t.get("trp", 0) for t in my_transfers if sign_mapping.get(t.get("tty")) == 1)
+        print(f"  Kontrolle an DIR SELBST (Saison ab {SEASON_START[:10]}):")
+        print(f"    Startbudget:            {STARTBUDGET:>15,.0f} EUR".replace(",", "."))
+        print(f"    - Kaeufe:               {eigene_kaeufe:>15,.0f} EUR".replace(",", "."))
+        print(f"    + Verkaeufe:            {eigene_verkaeufe:>15,.0f} EUR".replace(",", "."))
+        print(f"    + Bonus (Restgroesse):  {known_total_bonus:>15,.0f} EUR".replace(",", "."))
+        print(f"    = dein echter Stand:    {my_real_budget:>15,.0f} EUR".replace(",", "."))
+        print("    >>> Vergleiche diese Kauf-/Verkaufssummen mit deiner Kickbase-App.")
+        print("        Stimmen sie nicht, liegt der Fehler in den Rohdaten, nicht in der Formel.")
     else:
         print("Kauf/Verkauf liess sich nicht beweisen - nutze das statistische Verfahren ...")
         sign_mapping, known_total_bonus = initial_calibration(
@@ -520,10 +578,16 @@ def main() -> None:
         if manager_id == my_user_id:
             est_budget = my_real_budget
             note = "(echter Wert)"
+            breakdown = None
         else:
             transfers = other_transfers_by_manager.get(manager_id, [])
             est_budget = estimate_budget(transfers, sign_mapping, known_total_bonus)
             note = "(geschaetzt)"
+            kaeufe = sum(t.get("trp", 0) for t in transfers if sign_mapping.get(t.get("tty")) == -1)
+            verkaeufe = sum(t.get("trp", 0) for t in transfers if sign_mapping.get(t.get("tty")) == 1)
+            n_kauf = sum(1 for t in transfers if sign_mapping.get(t.get("tty")) == -1)
+            n_verkauf = sum(1 for t in transfers if sign_mapping.get(t.get("tty")) == 1)
+            breakdown = (n_kauf, kaeufe, n_verkauf, verkaeufe)
 
         results.append({
             "name": name,
@@ -531,6 +595,7 @@ def main() -> None:
             "team_value": team_value,
             "points": points,
             "note": note,
+            "breakdown": breakdown,
         })
 
     results.sort(key=lambda r: r["budget"], reverse=True)
@@ -544,12 +609,27 @@ def main() -> None:
         console_lines.append(f"{r['name']:<25} {budget_str:>16} {r['note']:<12} {tv_str:>16}  {pts_str:>8}")
     print("\n" + "\n".join(console_lines))
 
+    # --- Aufschluesselung zum manuellen Gegenrechnen --------------------------
+    print("\n\nAUFSCHLUESSELUNG (zum Abgleich mit deiner manuellen Auswertung)")
+    print(f"Formel je Teilnehmer: {STARTBUDGET:,.0f} - Kaeufe + Verkaeufe + Bonus "
+          f"{known_total_bonus:,.0f}".replace(",", "."))
+    print(f"{'Name':<20} {'Anz':>4} {'Kaeufe':>16} {'Anz':>4} {'Verkaeufe':>16} {'= Kontostand':>16}")
+    print("-" * 82)
+    for r in results:
+        if not r["breakdown"]:
+            print(f"{r['name']:<20} {'':>4} {'(dein echter Wert)':>16} "
+                  f"{'':>4} {'':>16} {r['budget']:>16,.0f}".replace(",", "."))
+            continue
+        n_k, kaeufe, n_v, verkaeufe = r["breakdown"]
+        print(f"{r['name']:<20} {n_k:>4} {kaeufe:>16,.0f} {n_v:>4} {verkaeufe:>16,.0f} "
+              f"{r['budget']:>16,.0f}".replace(",", "."))
+
     # --- Telegram-Nachricht (optional) ---------------------------------------
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if bot_token and chat_id:
         timestamp = time.strftime("%d.%m.%Y %H:%M")
-        msg_lines = [f"<b>Kickbase Kontostand - {LEAGUE_NAME}</b>", f"Stand: {timestamp} Uhr", ""]
+        msg_lines = [f"<b>Kickbase Kontostand - {league_display_name}</b>", f"Stand: {timestamp} Uhr", ""]
         for r in results:
             budget_str = f"{r['budget']:,.0f}".replace(",", ".")
             marker = " (echt)" if r["note"].startswith("(echter") else ""
